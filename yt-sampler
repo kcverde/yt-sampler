@@ -27,6 +27,7 @@ EXAMPLES = """examples:
 
 clips are named BPM-first, so `ls` sorts them by tempo
 -b/--bars cuts to whole bars, so clips loop seamlessly
+starts snap to the nearest transient; edges get a few ms of fade
 times accept 90, 1:30, 1:02:03 or 1m30s
 always quote the URL — the ? and & in YouTube links confuse the shell
 (zsh fails outright with "no matches found" on an unquoted ?)"""
@@ -41,6 +42,12 @@ MIN_CONFIDENCE = 0.5    # share of gaps that must survive the outlier filter
 
 BEATS_PER_BAR = 4       # 4/4 throughout; odd meters would need their own flag
 PROBE_SECONDS = 30.0    # window used to read tempo before a bar-locked cut
+
+SNAP_RADIUS = 0.25      # furthest a clip start will move to land on a transient
+SNAP_CONTEXT = 2.0      # audio either side of the target, for onset detection
+FADE_IN = 0.003         # kept very short so it barely touches the first transient
+FADE_OUT = 0.005        # long enough to kill the end click, short enough to loop
+MIN_FADE_LENGTH = 0.05  # below this a clip is basically all fade, so don't
 
 
 # --- small helpers -----------------------------------------------------------
@@ -172,8 +179,24 @@ def download_audio(url, tmpdir, args):
     return os.path.join(tmpdir, found[0])
 
 
-def cut(src, start, length, out, args):
-    """Slice `src` to `out`. A length of None runs to the end of the stream."""
+def fade_filter(length):
+    """afade in/out for a clip of `length` seconds, or None if it can't apply.
+
+    Slicing at an arbitrary point leaves the waveform at some non-zero value, and
+    that step is what clicks. A couple of milliseconds is enough to remove it.
+    """
+    if length is None or length < MIN_FADE_LENGTH:
+        return None
+    return (f"afade=t=in:st=0:d={FADE_IN}"
+            f",afade=t=out:st={length - FADE_OUT:.6f}:d={FADE_OUT}")
+
+
+def cut(src, start, length, out, args, fade=True):
+    """Slice `src` to `out`. A length of None runs to the end of the stream.
+
+    `fade` is off for the analysis probes — a probe exists to be measured, and
+    tapering its edges would only skew the onset and tempo readings.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
         # Microsecond precision: at 1ms a bar-locked clip lands up to ~44 samples
@@ -182,8 +205,13 @@ def cut(src, start, length, out, args):
     ]
     if length is not None:
         cmd += ["-t", f"{length:.6f}"]
+    cmd += ["-vn"]
+
+    chain = fade_filter(length) if fade and not args.no_fade else None
+    if chain:
+        cmd += ["-af", chain]
+
     cmd += [
-        "-vn",
         "-ac", "1" if args.mono else "2",
         "-ar", str(args.sr),
         "-c:a", codec_for(args.bits),
@@ -227,6 +255,11 @@ def peak_normalize(path, target_db, bits):
     os.replace(tmp, path)
 
 
+def _parse_timestamps(stdout):
+    """aubiotrack and aubioonset both print one time per line."""
+    return [float(t) for t in stdout.split() if _NUMBER_RE.match(t)]
+
+
 def _fold_octave(bpm):
     """Onset detectors routinely lock onto half or double time. Fold the value
     into a musical range and round."""
@@ -249,7 +282,7 @@ def _bpm_from_beat_track(path):
     if proc.returncode != 0:
         return None
 
-    beats = [float(t) for t in proc.stdout.split() if _NUMBER_RE.match(t)]
+    beats = _parse_timestamps(proc.stdout)
     if len(beats) < MIN_BEATS:
         return None
 
@@ -292,6 +325,40 @@ def detect_bpm(path):
     return None
 
 
+def snap_to_onset(src, start, duration, tmpdir, args, floor=0.0):
+    """Move `start` onto the nearest transient within SNAP_RADIUS.
+
+    A random offset has no relationship to the music, so clips routinely open
+    partway through a hit. Detection needs more context than the search radius,
+    so a wider window is analysed and the onsets are filtered back down to the
+    radius afterwards.
+
+    Returns `start` unchanged when no onset is close enough — a bounded move is
+    the point, since snapping to something distant would silently relocate the
+    clip. `floor` keeps a snap from reaching back into the previous clip.
+    """
+    if not shutil.which("aubioonset"):
+        return start
+
+    win_start = max(0.0, start - SNAP_CONTEXT)
+    win_end = min(duration, start + SNAP_CONTEXT)
+    if win_end - win_start < 0.5:
+        return start
+
+    probe = os.path.join(tmpdir, "onset.wav")
+    cut(src, win_start, win_end - win_start, probe, args, fade=False)
+    proc = run(["aubioonset", probe])
+    os.remove(probe)
+    if proc.returncode != 0:
+        return start
+
+    onsets = [win_start + t for t in _parse_timestamps(proc.stdout)]
+    near = [o for o in onsets if abs(o - start) <= SNAP_RADIUS and o >= floor]
+    if not near:
+        return start
+    return min(near, key=lambda o: abs(o - start))
+
+
 # --- bar locking -------------------------------------------------------------
 
 def bar_length(bpm, bars):
@@ -319,7 +386,7 @@ def probe_bpm(src, start, duration, tmpdir, args):
     """
     probe_len = min(PROBE_SECONDS, duration - start)
     probe = os.path.join(tmpdir, "probe.wav")
-    cut(src, start, probe_len, probe, args)
+    cut(src, start, probe_len, probe, args, fade=False)
     bpm = detect_bpm(probe)
     os.remove(probe)
     return bpm
@@ -400,6 +467,10 @@ def build_parser():
                    help="skip peak normalization")
     p.add_argument("--no-bpm", action="store_true",
                    help="skip BPM detection")
+    p.add_argument("--no-snap", action="store_true",
+                   help="don't nudge clip starts onto the nearest transient")
+    p.add_argument("--no-fade", action="store_true",
+                   help="skip the few-ms fades that remove edge clicks")
 
     p.add_argument("--seed", type=int, help="seed the RNG for reproducible picks")
     p.add_argument("--cookies-from-browser", metavar="BROWSER",
@@ -537,7 +608,18 @@ def main():
     with tempfile.TemporaryDirectory(prefix="yt-sampler-") as tmpdir:
         src = download_audio(args.url, tmpdir, args)
 
+        prev_end = 0.0
         for index, (begin, length) in enumerate(windows, 1):
+            # Snap before working out the bar length, so a bar-locked loop runs
+            # for exactly N bars measured from the transient it now starts on.
+            if not whole and not args.no_snap:
+                begin = snap_to_onset(src, begin, duration, tmpdir, args, prev_end)
+
+            # A snap can only move a start by up to SNAP_RADIUS, so trimming a
+            # fixed-length clip back to the end of the video is sub-second here.
+            if not args.bars and length is not None and begin + length > duration:
+                length = duration - begin
+
             bpm = None
             if args.bars:
                 bpm = probe_bpm(src, begin, duration, tmpdir, args)
@@ -568,6 +650,7 @@ def main():
             final = unique_path(args.outdir, stem)
             shutil.move(staged, final)
             written.append(final)
+            prev_end = begin + (length or 0.0)
             print(f"  → {final}")
 
     noun = "video" if whole else "clip(s)"
