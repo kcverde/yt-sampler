@@ -33,7 +33,7 @@ is missing.
 Then grab the script and make it executable:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/yt-sampler.git
+git clone https://github.com/kcverde/yt-sampler.git
 cd yt-sampler
 chmod +x yt-sampler
 ./yt-sampler --help
