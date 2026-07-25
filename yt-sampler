@@ -23,8 +23,10 @@ EXAMPLES = """examples:
   yt-sampler "https://youtu.be/VIDEO_ID" 1:23 8       one 8s clip at 1:23
   yt-sampler "https://youtu.be/VIDEO_ID" -r           5 random 20s clips
   yt-sampler "https://youtu.be/VIDEO_ID" -r 10 -d 15  10 random 15s clips
+  yt-sampler "https://youtu.be/VIDEO_ID" -r -b 4      5 random 4-bar loops
 
 clips are named BPM-first, so `ls` sorts them by tempo
+-b/--bars cuts to whole bars, so clips loop seamlessly
 times accept 90, 1:30, 1:02:03 or 1m30s
 always quote the URL — the ? and & in YouTube links confuse the shell
 (zsh fails outright with "no matches found" on an unquoted ?)"""
@@ -36,6 +38,9 @@ BPM_MIN, BPM_MAX = 70.0, 180.0
 MIN_BEATS = 8           # fewer detected beats than this and the tempo is a guess
 GAP_TOLERANCE = 0.20    # a beat gap this far off the median is treated as an outlier
 MIN_CONFIDENCE = 0.5    # share of gaps that must survive the outlier filter
+
+BEATS_PER_BAR = 4       # 4/4 throughout; odd meters would need their own flag
+PROBE_SECONDS = 30.0    # window used to read tempo before a bar-locked cut
 
 
 # --- small helpers -----------------------------------------------------------
@@ -171,10 +176,12 @@ def cut(src, start, length, out, args):
     """Slice `src` to `out`. A length of None runs to the end of the stream."""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-ss", f"{start:.3f}", "-i", src,
+        # Microsecond precision: at 1ms a bar-locked clip lands up to ~44 samples
+        # off its exact bar, which is audible drift once the clip is looped.
+        "-ss", f"{start:.6f}", "-i", src,
     ]
     if length is not None:
-        cmd += ["-t", f"{length:.3f}"]
+        cmd += ["-t", f"{length:.6f}"]
     cmd += [
         "-vn",
         "-ac", "1" if args.mono else "2",
@@ -285,9 +292,42 @@ def detect_bpm(path):
     return None
 
 
+# --- bar locking -------------------------------------------------------------
+
+def bar_length(bpm, bars):
+    """Seconds occupied by `bars` bars of 4/4 at `bpm`."""
+    return bars * BEATS_PER_BAR * 60.0 / bpm
+
+
+def widest_bar_length(bars):
+    """Longest a bar-locked clip can possibly be.
+
+    Tempo isn't known until each clip has been probed, but window placement has
+    to happen first. Reserving the slowest-tempo length up front means the real
+    clip can only ever come out shorter than its slot, so clips still can't
+    overlap without any need to re-check afterwards.
+    """
+    return bar_length(BPM_MIN, bars)
+
+
+def probe_bpm(src, start, duration, tmpdir, args):
+    """Read tempo from a wide window at `start`.
+
+    A bar-locked clip can be just a few seconds long — too short to hold the
+    MIN_BEATS aubio needs — so tempo comes from a generous probe and is then
+    reused for the clip itself rather than re-detected on the short result.
+    """
+    probe_len = min(PROBE_SECONDS, duration - start)
+    probe = os.path.join(tmpdir, "probe.wav")
+    cut(src, start, probe_len, probe, args)
+    bpm = detect_bpm(probe)
+    os.remove(probe)
+    return bpm
+
+
 # --- clip selection ----------------------------------------------------------
 
-def pick_windows(duration, count, clip_len, rng):
+def pick_windows(duration, count, clip_len, rng, bars=None):
     """Pick `count` random windows that never overlap each other.
 
     Drawing starts independently would routinely produce near-duplicate clips a
@@ -306,8 +346,12 @@ def pick_windows(duration, count, clip_len, rng):
 
     capacity = int(duration // clip_len)
     if count > capacity:
+        # In bars mode clip_len is the reserved worst-case slot, not anything
+        # the user asked for, so name the bars and explain where the size came from.
+        size = (f"{bars}-bar (up to {clip_len:.0f}s)" if bars
+                else f"{clip_len:.0f}s")
         warn(
-            f"only {capacity} non-overlapping {clip_len:.0f}s clip(s) fit in "
+            f"only {capacity} non-overlapping {size} clip(s) fit in "
             f"{fmt_ts(duration)} — making {capacity} instead of {count}"
         )
         count = capacity
@@ -338,6 +382,9 @@ def build_parser():
                         f"non-overlapping clips (default {DEFAULT_COUNT})")
     p.add_argument("-d", "--seconds", metavar="SECONDS",
                    help="clip length, flag form")
+    p.add_argument("-b", "--bars", type=int, metavar="N",
+                   help="cut clips to exactly N bars of 4/4 so they loop "
+                        "seamlessly; length comes from the detected tempo")
     p.add_argument("-s", "--start", metavar="START", help="start time, flag form")
     p.add_argument("-o", "--outdir", default="samples",
                    help="output directory (default ./samples)")
@@ -390,7 +437,17 @@ def resolve_times(args, parser):
         parser.error("give a start time or --random, not both")
     if args.random is not None and args.random < 1:
         parser.error("--random must be at least 1")
-    if raw_seconds is not None and start is None and args.random is None:
+
+    if args.bars is not None:
+        if args.bars < 1:
+            parser.error("--bars must be at least 1")
+        if raw_seconds is not None:
+            parser.error("give --bars or a clip length, not both")
+        if args.no_bpm:
+            parser.error("--bars needs the tempo to work out a bar — drop --no-bpm")
+
+    length_given = raw_seconds is not None or args.bars is not None
+    if length_given and start is None and args.random is None:
         parser.error(
             "a clip length on its own doesn't say what to cut — "
             "add a start time, or --random to scatter clips through the video"
@@ -427,11 +484,18 @@ def main():
     start, clip_len = resolve_times(args, parser)
 
     check_tools()
+    if args.bars and not shutil.which("aubiotrack"):
+        die("--bars needs aubio to read the tempo (brew install aubio)")
     if not args.no_bpm and not shutil.which("aubiotrack"):
         warn("aubio not found — BPM will be omitted (brew install aubio)")
 
     title, duration = fetch_metadata(args.url, args)
     print(f"{title}  [{fmt_ts(duration)}]")
+
+    # Bar-locked clips get their slot sized for the slowest tempo we'd accept,
+    # so the real cut can only come in shorter and can't run into its neighbour.
+    if args.bars:
+        clip_len = widest_bar_length(args.bars)
 
     whole = start is None and args.random is None
     if whole:
@@ -442,13 +506,15 @@ def main():
         if start >= duration:
             die(f"start {fmt_ts(start)} is past the end of the video "
                 f"({fmt_ts(duration)})")
-        if start + clip_len > duration:
+        # With --bars the real length isn't known until the tempo is read, so
+        # leave the end-of-video check to the cutting loop below.
+        if not args.bars and start + clip_len > duration:
             clip_len = duration - start
             warn(f"clip runs past the end — shortened to {clip_len:.1f}s")
         windows = [(start, clip_len)]
     else:
         rng = random.Random(args.seed)
-        windows = pick_windows(duration, args.random, clip_len, rng)
+        windows = pick_windows(duration, args.random, clip_len, rng, args.bars)
 
     if args.dry_run:
         if whole:
@@ -457,7 +523,11 @@ def main():
             return
         print(f"\nwould write {len(windows)} clip(s) to {args.outdir}/:")
         for begin, length in windows:
-            print(f"  {fmt_ts(begin)} → {fmt_ts(begin + length)}  ({length:.1f}s)")
+            if args.bars:
+                print(f"  {fmt_ts(begin)} → {args.bars} bars "
+                      f"(up to {length:.1f}s, exact length set by the tempo)")
+            else:
+                print(f"  {fmt_ts(begin)} → {fmt_ts(begin + length)}  ({length:.1f}s)")
         return
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -468,13 +538,31 @@ def main():
         src = download_audio(args.url, tmpdir, args)
 
         for index, (begin, length) in enumerate(windows, 1):
+            bpm = None
+            if args.bars:
+                bpm = probe_bpm(src, begin, duration, tmpdir, args)
+                if bpm:
+                    length = bar_length(bpm, args.bars)
+                else:
+                    # Never emit a clip that claims to be bar-locked but isn't —
+                    # a loop that doesn't loop only shows up later in the DAW.
+                    length = min(DEFAULT_SECONDS, duration - begin)
+                    warn(f"no reliable tempo at {fmt_ts(begin)} — falling back "
+                         f"to {length:.0f}s, NOT bar-locked")
+                if begin + length > duration:
+                    length = duration - begin
+                    bpm = None
+                    warn(f"{args.bars} bars won't fit at {fmt_ts(begin)} — "
+                         f"shortened to {length:.1f}s, NOT bar-locked")
+
             staged = os.path.join(tmpdir, f"clip{index}.wav")
             cut(src, begin, length, staged, args)
 
             if not args.no_normalize:
                 peak_normalize(staged, args.peak, args.bits)
 
-            bpm = None if args.no_bpm else detect_bpm(staged)
+            if not args.bars:
+                bpm = None if args.no_bpm else detect_bpm(staged)
 
             stem = build_stem(slug, bpm, begin, length, whole, args.no_bpm)
             final = unique_path(args.outdir, stem)
