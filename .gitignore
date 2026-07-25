@@ -1,0 +1,18 @@
+# Downloaded audio — never commit this. It's other people's copyrighted work,
+# and the files are large enough to bloat the repo permanently.
+samples/
+*.wav
+*.mp3
+*.m4a
+*.opus
+*.webm
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
