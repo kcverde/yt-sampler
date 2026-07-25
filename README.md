@@ -177,6 +177,15 @@ that. It just moves audio around.
 The `samples/` directory is in `.gitignore` for the same reason: don't commit other
 people's music to a public repo.
 
+## Building a whole sample pack
+
+[SAMPLE-PACK-PROMPT.md](SAMPLE-PACK-PROMPT.md) is a reusable prompt for handing to
+an LLM agent so it assembles a full pack — tempo-matched drum and chord loops,
+pitched one-shots, vocal chops, textures — using this tool. It carries the source
+keywords that find isolated stems, and the traps worth avoiding (a "drone" video
+sounds the fifth alongside the root, and a short cut from a performance is a
+phrase, not a one-shot).
+
 ## Possible next steps
 
 - Caching downloads by video ID
