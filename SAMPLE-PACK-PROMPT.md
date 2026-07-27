@@ -22,8 +22,8 @@ Six subfolders:
 
 | folder   | what        | how to cut                      |
 |----------|-------------|---------------------------------|
-| drums    | 3 loops     | 8 bars, tempo-matched           |
-| chords   | 3 loops     | 8 bars, SAME tempo as drums     |
+| drums    | 3 loops     | 4 bars, tempo-matched           |
+| chords   | 3 loops     | 4 bars, SAME tempo as drums     |
 | bass     | 3 one-shots | single sustained notes, 4–5s    |
 | lead     | 6 options   | 2 each from 3 DIFFERENT videos  |
 | vocals   | 5 chops     | ~2s each                        |
@@ -31,6 +31,8 @@ Six subfolders:
 
 Loops must be tempo-matched to each other. One-shots don't need to be — I'll
 pitch-match those myself.
+
+IMPORTANT: No sample can be more than 20 seconds long.
 
 ## The tool
 
@@ -45,6 +47,7 @@ yt-sampler <url> [START] [SECONDS]
                    length is derived from the detected tempo
 -o, --outdir DIR   output directory
 --no-bpm           drop the BPM prefix from filenames
+--note             detect the root note and lead the filename with it
 --seed N           reproducible random picks
 --dry-run          show the plan, download nothing
 ```
@@ -61,7 +64,7 @@ Patterns:
 
 ```bash
 yt-sampler "URL" -r 3 -b 8 -o ~/Desktop/pack/drums    # 3 x 8-bar loops
-yt-sampler "URL" 23 4 --no-bpm -o ~/Desktop/pack/bass # one clip, 23s in, 4s
+yt-sampler "URL" 23 4 --note --no-bpm -o ~/Desktop/pack/bass  # -> A1__...wav
 yt-sampler "URL" -r 3 -d 2 --no-bpm -o ~/Desktop/pack/vocals
 ```
 
@@ -131,8 +134,16 @@ ffmpeg -hide_banner -i f.wav -af volumedetect -f null - 2>&1 | grep volume
 - **Tempo**: read the BPM the tool put in the filename. If a chord source comes
   back at 150 against 90 drums, that's a 5:3 ratio and awkward to beat-match —
   throw it out and find another source rather than handing it to me.
-- **Root note** (pitched one-shots): `aubiopitch -u midi`, take the median,
-  convert to a note name, and tell me what each sample's root is.
+- **Root note** (pitched one-shots): always cut these with `--note`, which writes the
+  detected note into the filename. A clip named `xxx__` means the pitch wasn't steady
+  enough to name — that's usually a phrase rather than a one-shot, so find a better
+  source or a better start time.
+
+**NEVER trust a note stated in a video title.** A pack was once built from videos titled
+`a1-55-hz`, `c2-tuning-pitch-65-41-hz` and `d2-tuning-pitch-73-42-hz`, all cut at the same
+offset on the assumption each held one constant tone. They sequence instead, and every
+sample came out a whole tone off. `--note` measures what is actually in the clip; the
+title is a guess.
 
 Report the root notes — I need them to map the samples.
 

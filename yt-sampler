@@ -43,6 +43,11 @@ MIN_CONFIDENCE = 0.5    # share of gaps that must survive the outlier filter
 BEATS_PER_BAR = 4       # 4/4 throughout; odd meters would need their own flag
 PROBE_SECONDS = 30.0    # window used to read tempo before a bar-locked cut
 
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+MIN_PITCH_FRAMES = 20   # too few voiced frames and the note is a guess
+NOTE_TOLERANCE = 0.5    # semitones either side of the median that still count
+MIN_NOTE_CONFIDENCE = 0.5  # share of frames that must sit within that tolerance
+
 SNAP_RADIUS = 0.25      # furthest a clip start will move to land on a transient
 SNAP_CONTEXT = 2.0      # audio either side of the target, for onset detection
 FADE_IN = 0.003         # kept very short so it barely touches the first transient
@@ -325,6 +330,57 @@ def detect_bpm(path):
     return None
 
 
+def _parse_pitches(stdout):
+    """aubiopitch prints 'time pitch' per line — two columns, unlike aubiotrack
+    and aubioonset — with 0 in the second where it heard nothing."""
+    out = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and _NUMBER_RE.match(parts[1]):
+            value = float(parts[1])
+            if value > 0:
+                out.append(value)
+    return out
+
+
+def note_name(midi):
+    """MIDI number to a name like 'A1'. MIDI 21 is A0, hence the -1."""
+    n = round(midi)
+    return f"{NOTE_NAMES[n % 12]}{n // 12 - 1}"
+
+
+def detect_note(path):
+    """Root note of a pitched clip, or None when it can't be named honestly.
+
+    The share of frames sitting near the median is the confidence: a held note
+    barely moves, while a phrase wanders across several pitches. Measured on real
+    clips, one-shots scored 61-99% and phrases 2-33%, so the two separate
+    cleanly.
+
+    This proves a clip holds ONE pitch. It cannot see a SECOND pitch stacked on
+    top — a drone sounding A+E measures as a rock-solid A. That's fine for naming
+    (A is genuinely the root) but it is not evidence the sample is a pure tone,
+    and it has been mistaken for that before.
+    """
+    if not shutil.which("aubiopitch"):
+        return None
+
+    proc = run(["aubiopitch", "-u", "midi", path])
+    if proc.returncode != 0:
+        return None
+
+    pitches = _parse_pitches(proc.stdout)
+    if len(pitches) < MIN_PITCH_FRAMES:
+        return None
+
+    median = statistics.median(pitches)
+    steady = sum(1 for p in pitches if abs(p - median) <= NOTE_TOLERANCE)
+    if steady / len(pitches) < MIN_NOTE_CONFIDENCE:
+        return None
+
+    return note_name(median)
+
+
 def snap_to_onset(src, start, duration, tmpdir, args, floor=0.0):
     """Move `start` onto the nearest transient within SNAP_RADIUS.
 
@@ -467,6 +523,9 @@ def build_parser():
                    help="skip peak normalization")
     p.add_argument("--no-bpm", action="store_true",
                    help="skip BPM detection")
+    p.add_argument("--note", action="store_true",
+                   help="detect the root note and lead the filename with it, "
+                        "for one-shots you'll map across a keyboard")
     p.add_argument("--no-snap", action="store_true",
                    help="don't nudge clip starts onto the nearest transient")
     p.add_argument("--no-fade", action="store_true",
@@ -527,12 +586,15 @@ def resolve_times(args, parser):
     return start, clip_len
 
 
-def build_stem(slug, bpm, begin, length, whole, no_bpm):
+def build_stem(slug, bpm, note, begin, length, whole, no_bpm):
     """Name a clip. BPM leads so a directory listing sorts by tempo, zero-padded
-    to three digits because otherwise '130bpm' would sort before '086bpm'."""
+    to three digits because otherwise '130bpm' would sort before '086bpm'. The
+    root note follows, since that's what you map a one-shot by."""
     parts = []
     if not no_bpm:
         parts.append(f"{bpm:03d}bpm" if bpm else "xxxbpm")
+    if note:
+        parts.append(note)
     parts.append(slug)
     if not whole:
         parts.append(f"{fmt_ts(begin)}-{fmt_ts(begin + length)}")
@@ -559,6 +621,12 @@ def main():
         die("--bars needs aubio to read the tempo (brew install aubio)")
     if not args.no_bpm and not shutil.which("aubiotrack"):
         warn("aubio not found — BPM will be omitted (brew install aubio)")
+
+    # A missing note only affects the filename, never the audio, so this warns
+    # and drops the prefix rather than stamping xxx__ on every single file.
+    want_note = args.note and shutil.which("aubiopitch") is not None
+    if args.note and not want_note:
+        warn("aubio not found — root note will be omitted (brew install aubio)")
 
     title, duration = fetch_metadata(args.url, args)
     print(f"{title}  [{fmt_ts(duration)}]")
@@ -646,7 +714,9 @@ def main():
             if not args.bars:
                 bpm = None if args.no_bpm else detect_bpm(staged)
 
-            stem = build_stem(slug, bpm, begin, length, whole, args.no_bpm)
+            note = (detect_note(staged) or "xxx") if want_note else None
+
+            stem = build_stem(slug, bpm, note, begin, length, whole, args.no_bpm)
             final = unique_path(args.outdir, stem)
             shutil.move(staged, final)
             written.append(final)

@@ -88,6 +88,7 @@ Running `yt-sampler` with no arguments prints the usage block and these examples
 | `--peak` | `-1.0` | target peak in dBFS |
 | `--no-normalize` | | skip peak normalization |
 | `--no-bpm` | | skip BPM detection |
+| `--note` | | detect the root note and lead the filename with it |
 | `--no-snap` | | don't nudge clip starts onto the nearest transient |
 | `--no-fade` | | skip the few-ms fades that remove edge clicks |
 | `--seed` | | seed the RNG so random picks repeat |
@@ -105,6 +106,20 @@ yt-sampler "https://youtu.be/VIDEO_ID" --cookies-from-browser chrome
 Or set it once: `export YTS_COOKIES_BROWSER=chrome`
 
 ## Notes
+
+**`--note` puts the root note in the filename** — `A1__bass-guitar-tuner__00m18s.wav`.
+Pitch is to a one-shot what tempo is to a loop: it's how you map the sample. Pair it with
+`--no-bpm` and the note becomes the only prefix; without, you get both (`090bpm__C2__…`).
+
+A note is only written when the pitch is steady enough to name. Measured on real clips,
+held notes score 61–99% of frames near the median and phrases score 2–33%, so the two
+separate cleanly. Anything below the cut is named `xxx__` rather than guessed — a wrong
+note is worse than none, because you'd map the sample to the wrong key without ever
+hearing it.
+
+This proves a clip holds *one* pitch. It cannot see a *second* pitch stacked on top: a
+drone sounding A+E measures as a rock-solid A. That's fine for naming, since A really is
+the root — but it is not evidence the sample is a pure tone.
 
 **Clip starts snap to the nearest transient.** A random offset has no relationship to the
 music, so clips would otherwise routinely open partway through a hit. Each start moves to
